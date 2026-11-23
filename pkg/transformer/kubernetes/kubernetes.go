@@ -219,24 +219,15 @@ func (k *Kubernetes) InitSvc(name string, service kobject.ServiceConfig) *api.Se
 	return svc
 }
 
-// InitConfigMapForEnvWithLookup initializes a ConfigMap object from an env_file with variable interpolation support
-// using the provided lookup function to resolve variable references like ${VAR} or ${VAR:-default}
-func (k *Kubernetes) InitConfigMapForEnvWithLookup(name string, opt kobject.ConvertOptions, envFile string, lookup func(key string) (string, bool)) *api.ConfigMap {
-	workDir, err := transformer.GetComposeFileDir(opt.InputFiles)
-	if err != nil {
-		log.Fatalf("Unable to get compose file directory: %s", err)
-	}
-	envs, err := LoadEnvFiles(filepath.Join(workDir, envFile), lookup)
-	if err != nil {
-		log.Fatalf("Unable to retrieve env file: %s", err)
-	}
-
+// initConfigMapForEnvData builds the ConfigMap that backs an env_file, given its
+// already-parsed key/value pairs.
+func initConfigMapForEnvData(name, envFile string, envs map[string]string) *api.ConfigMap {
 	// Remove root pathing
 	// replace all other slashes / periods
 	envName := FormatEnvName(envFile, name)
 
 	// In order to differentiate files, we append to the name and remove '.env' if applicable from the file name
-	configMap := &api.ConfigMap{
+	return &api.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "ConfigMap",
 			APIVersion: "v1",
@@ -247,39 +238,88 @@ func (k *Kubernetes) InitConfigMapForEnvWithLookup(name string, opt kobject.Conv
 		},
 		Data: envs,
 	}
+}
 
-	return configMap
+// InitConfigMapForEnvWithLookup initializes a ConfigMap object from an env_file with variable interpolation support
+// using the provided lookup function to resolve variable references like ${VAR} or ${VAR:-default}
+func (k *Kubernetes) InitConfigMapForEnvWithLookup(name string, opt kobject.ConvertOptions, envFile string, lookup func(key string) (string, bool)) (*api.ConfigMap, error) {
+	workDir, err := transformer.GetComposeFileDir(opt.InputFiles)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to get compose file directory")
+	}
+	envs, err := LoadEnvFiles(ResolveEnvFilePath(workDir, envFile), lookup)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to retrieve env_file %q for service %q", envFile, name)
+	}
+
+	configMap := initConfigMapForEnvData(name, envFile, envs)
+
+	warnSensitiveConfigMapKeys(name, envFile, envs)
+	if opt.NoInterpolate {
+		warnUnresolvedPlaceholders(name, "env_file "+envFile, envs)
+	}
+
+	return configMap, nil
 }
 
 // InitConfigMapForEnv initializes a ConfigMap object
-func (k *Kubernetes) InitConfigMapForEnv(name string, opt kobject.ConvertOptions, envFile string) *api.ConfigMap {
+func (k *Kubernetes) InitConfigMapForEnv(name string, opt kobject.ConvertOptions, envFile string) (*api.ConfigMap, error) {
 	workDir, err := transformer.GetComposeFileDir(opt.InputFiles)
 	if err != nil {
-		log.Fatalf("Unable to get compose file directory: %s", err)
+		return nil, errors.Wrap(err, "unable to get compose file directory")
 	}
-	envs, err := GetEnvsFromFile(filepath.Join(workDir, envFile))
+	envs, err := GetEnvsFromFile(ResolveEnvFilePath(workDir, envFile))
 	if err != nil {
-		log.Fatalf("Unable to retrieve env file: %s", err)
+		return nil, errors.Wrapf(err, "unable to retrieve env_file %q for service %q", envFile, name)
 	}
 
-	// Remove root pathing
-	// replace all other slashes / periods
-	envName := FormatEnvName(envFile, name)
+	configMap := initConfigMapForEnvData(name, envFile, envs)
 
-	// In order to differentiate files, we append to the name and remove '.env' if applicable from the file name
-	configMap := &api.ConfigMap{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "ConfigMap",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   envName,
-			Labels: transformer.ConfigLabels(name + "-" + envName),
-		},
-		Data: envs,
+	warnSensitiveConfigMapKeys(name, envFile, envs)
+	if opt.NoInterpolate {
+		warnUnresolvedPlaceholders(name, "env_file "+envFile, envs)
 	}
 
-	return configMap
+	return configMap, nil
+}
+
+// sensitiveKeyPattern matches env_file keys that suggest the value is a
+// credential and therefore better stored in a Secret than a ConfigMap.
+var sensitiveKeyPattern = regexp.MustCompile(`(?i)(secret|password|token)`)
+
+// warnSensitiveConfigMapKeys warns, once per key, when an env_file key looks like
+// it holds sensitive material. Only the key name is reported, never the value,
+// and nothing is converted automatically.
+func warnSensitiveConfigMapKeys(service, envFile string, envs map[string]string) {
+	keys := make([]string, 0, len(envs))
+	for key := range envs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if sensitiveKeyPattern.MatchString(key) {
+			log.Warnf("env_file %q for service %q defines key %q which looks sensitive; consider using a Compose secret instead of a ConfigMap", envFile, service, key)
+		}
+	}
+}
+
+// unresolvedPlaceholderPattern matches a ${...} reference that survived loading,
+// which happens under --no-interpolate.
+var unresolvedPlaceholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
+
+// warnUnresolvedPlaceholders reports, per key, values that still contain a
+// literal ${...} placeholder. Only the key name is reported, never the value.
+func warnUnresolvedPlaceholders(service, source string, envs map[string]string) {
+	keys := make([]string, 0, len(envs))
+	for key := range envs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if unresolvedPlaceholderPattern.MatchString(envs[key]) {
+			log.Warnf("%s for service %q keeps an uninterpolated placeholder for key %q because interpolation is disabled", source, service, key)
+		}
+	}
 }
 
 // IntiConfigMapFromFileOrDir will create a configmap from dir or file
@@ -625,31 +665,61 @@ func (k *Kubernetes) initIngress(name string, service kobject.ServiceConfig, por
 // CreateSecrets create secrets
 func (k *Kubernetes) CreateSecrets(komposeObject kobject.KomposeObject) ([]*api.Secret, error) {
 	var objects []*api.Secret
-	for name, config := range komposeObject.Secrets {
-		if config.File != "" {
-			dataString, err := GetContentFromFile(config.File)
+
+	// Iterate in a stable order so repeated conversions are byte-for-byte identical.
+	names := make([]string, 0, len(komposeObject.Secrets))
+	for name := range komposeObject.Secrets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		config := komposeObject.Secrets[name]
+
+		// A secret may be sourced from a file or, since the Compose specification
+		// added it, from an environment variable. Pick the source without ever
+		// logging the value.
+		var data []byte
+		switch {
+		case config.File != "":
+			content, err := GetContentFromFile(config.File)
 			if err != nil {
-				log.Fatal("unable to read secret from file: ", config.File)
-				return nil, err
+				return nil, errors.Wrapf(err, "unable to read secret %q from file %q", name, config.File)
 			}
-			data := []byte(dataString)
-			resourceName := FormatResourceName(name)
-			secret := &api.Secret{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Secret",
-					APIVersion: "v1",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:   resourceName,
-					Labels: transformer.ConfigLabels(resourceName),
-				},
-				Type: api.SecretTypeOpaque,
-				Data: map[string][]byte{resourceName: data},
+			data = []byte(content)
+		case config.Environment != "":
+			value, ok := os.LookupEnv(config.Environment)
+			if !ok || value == "" {
+				return nil, fmt.Errorf("secret %q reads environment variable %q, but it is not set or is empty", name, config.Environment)
 			}
-			objects = append(objects, secret)
-		} else {
-			log.Warnf("External secrets %s is not currently supported - ignoring", name)
+			data = []byte(value)
+		case bool(config.External):
+			log.Warnf("External secret %s is not currently supported - ignoring", name)
+			continue
+		case config.Content != "":
+			// Compose `content` for secrets is only used when it was seeded from an
+			// environment variable by compose-go; that case is handled above via
+			// the Environment field.
+			return nil, fmt.Errorf("secret %q has inline content but no environment or file source; use a file or environment source", name)
+		default:
+			log.Warnf("Secret %s has no file, environment or external source - ignoring", name)
+			continue
 		}
+
+		resourceName := FormatResourceName(name)
+		secret := &api.Secret{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Secret",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   resourceName,
+				Labels: transformer.ConfigLabels(resourceName),
+			},
+			Type: api.SecretTypeOpaque,
+			Data: map[string][]byte{resourceName: data},
+		}
+		objects = append(objects, secret)
 	}
 	return objects, nil
 }
@@ -852,7 +922,7 @@ func (k *Kubernetes) ConfigSecretVolumes(name string, service kobject.ServiceCon
 		for _, secretConfig := range service.Secrets {
 			secretConfig := reformatSecretConfigUnderscoreWithDash(secretConfig)
 			if secretConfig.UID != "" {
-				log.Warnf("Ignore pid in secrets for service: %s", name)
+				log.Warnf("Ignore uid in secrets for service: %s", name)
 			}
 			if secretConfig.GID != "" {
 				log.Warnf("Ignore gid in secrets for service: %s", name)
@@ -1189,14 +1259,13 @@ func ConfigEnvs(service kobject.ServiceConfig, opt kobject.ConvertOptions) ([]ap
 	envs := transformer.EnvSort{}
 	envsFrom := []api.EnvFromSource{}
 
-	keysFromEnvFile := make(map[string]bool)
-	// If there is an env_file, use ConfigMaps and add them using EnvFrom
-
-	if len(service.EnvFile) > 0 {
-		// Load each env_file
-		for _, file := range service.EnvFile {
-			envName := FormatEnvName(file, service.Name)
-
+	// env_file entries become envFrom references to a generated ConfigMap. In
+	// Kubernetes an explicit `env` entry always wins over `envFrom`, so keeping
+	// a key in both places gives `environment` the precedence the Compose
+	// specification requires; the ConfigMap keeps the file's original value.
+	if len(service.EnvFiles) > 0 {
+		for _, envFile := range service.EnvFiles {
+			envName := FormatEnvName(envFile.Path, service.Name)
 			envsFrom = append(envsFrom, api.EnvFromSource{
 				ConfigMapRef: &api.ConfigMapEnvSource{
 					LocalObjectReference: api.LocalObjectReference{
@@ -1204,42 +1273,57 @@ func ConfigEnvs(service kobject.ServiceConfig, opt kobject.ConvertOptions) ([]ap
 					},
 				},
 			})
-
-			// Load environment variables from file
-			workDir, err := transformer.GetComposeFileDir(opt.InputFiles)
-			if err != nil {
-				log.Fatalf("Unable to get compose file directory: %s", err)
-			}
-			envLoad, err := GetEnvsFromFile(filepath.Join(workDir, file))
-			if err != nil {
-				return envs, envsFrom, errors.Wrap(err, "Unable to read env_file")
-			}
-
-			// Mark environment variable source to env file
-			for k := range envLoad {
-				keysFromEnvFile[k] = true
-			}
 		}
+	}
+
+	declaredSecrets := make(map[string]struct{}, len(service.Secrets))
+	for _, secret := range service.Secrets {
+		declaredSecrets[FormatResourceName(secret.Source)] = struct{}{}
 	}
 
 	// Load up the environment variables
 	for _, v := range service.Environment {
-		if !keysFromEnvFile[v.Name] {
-			if strings.Contains(v.Value, "run/secrets") {
-				v.Value = FormatResourceName(v.Value)
-			}
-			envs = append(envs, api.EnvVar{
-				Name:  v.Name,
-				Value: v.Value,
-			})
-		}
+		envs = append(envs, api.EnvVar{
+			Name:  v.Name,
+			Value: rewriteSecretReference(v.Value, declaredSecrets),
+		})
 	}
 
 	// Stable sorts data while keeping the original order of equal elements
 	// we need this because envs are not populated in any random order
 	// this sorting ensures they are populated in a particular order
 	sort.Stable(envs)
+
+	if opt.NoInterpolate {
+		for _, v := range envs {
+			if unresolvedPlaceholderPattern.MatchString(v.Value) {
+				log.Warnf("environment variable %q of service %q keeps an uninterpolated placeholder because interpolation is disabled", v.Name, service.Name)
+			}
+		}
+	}
+
 	return envs, envsFrom, nil
+}
+
+// secretReferencePattern matches a value that is exactly a /run/secrets/<name>
+// path. Only such a value is rewritten to the Kubernetes Secret resource name;
+// a substring match would corrupt ordinary strings that happen to contain
+// "run/secrets" (for example a URL).
+var secretReferencePattern = regexp.MustCompile(`^/run/secrets/([A-Za-z0-9._-]+)$`)
+
+// rewriteSecretReference maps a value of the form /run/secrets/<name> to the
+// formatted resource name, but only when <name> refers to a declared secret.
+// Everything else is returned unchanged.
+func rewriteSecretReference(value string, declaredSecrets map[string]struct{}) string {
+	match := secretReferencePattern.FindStringSubmatch(value)
+	if match == nil {
+		return value
+	}
+	name := FormatResourceName(match[1])
+	if _, ok := declaredSecrets[name]; !ok {
+		return value
+	}
+	return name
 }
 
 // ConfigAffinity configures the Affinity.
@@ -1310,7 +1394,7 @@ func configConstrains(constrains map[string]string, operator api.NodeSelectorOpe
 }
 
 // CreateWorkloadAndConfigMapObjects generates a Kubernetes artifact for each input type service
-func (k *Kubernetes) CreateWorkloadAndConfigMapObjects(name string, service kobject.ServiceConfig, opt kobject.ConvertOptions) []runtime.Object {
+func (k *Kubernetes) CreateWorkloadAndConfigMapObjects(name string, service kobject.ServiceConfig, opt kobject.ConvertOptions) ([]runtime.Object, error) {
 	var objects []runtime.Object
 	var replica int
 
@@ -1358,9 +1442,12 @@ func (k *Kubernetes) CreateWorkloadAndConfigMapObjects(name string, service kobj
 		objects = append(objects, k.InitSS(name, service, replica))
 	}
 
-	envConfigMaps := k.PargeEnvFiletoConfigMaps(name, service, opt)
+	envConfigMaps, err := k.PargeEnvFiletoConfigMaps(name, service, opt)
+	if err != nil {
+		return nil, err
+	}
 	objects = append(objects, envConfigMaps...)
-	return objects
+	return objects, nil
 }
 
 func (k *Kubernetes) createConfigMapFromComposeConfig(name string, service kobject.ServiceConfig, objects []runtime.Object) []runtime.Object {
@@ -1609,7 +1696,11 @@ func (k *Kubernetes) Transform(komposeObject kobject.KomposeObject, opt kobject.
 					return nil, err
 				}
 				// override..
-				objects = append(objects, k.CreateWorkloadAndConfigMapObjects(groupName, service, opt)...)
+				workloadObjects, err := k.CreateWorkloadAndConfigMapObjects(groupName, service, opt)
+				if err != nil {
+					return nil, err
+				}
+				objects = append(objects, workloadObjects...)
 				k.configKubeServiceAndIngressForService(service, groupName, &objects)
 
 				// Configure the container volumes.
@@ -1698,10 +1789,17 @@ func (k *Kubernetes) Transform(komposeObject kobject.KomposeObject, opt kobject.
 				pod := k.InitPod(name, service)
 				objects = append(objects, pod)
 			}
-			envConfigMaps := k.PargeEnvFiletoConfigMaps(name, service, opt)
+			envConfigMaps, err := k.PargeEnvFiletoConfigMaps(name, service, opt)
+			if err != nil {
+				return nil, err
+			}
 			objects = append(objects, envConfigMaps...)
 		} else {
-			objects = k.CreateWorkloadAndConfigMapObjects(name, service, opt)
+			workloadObjects, err := k.CreateWorkloadAndConfigMapObjects(name, service, opt)
+			if err != nil {
+				return nil, err
+			}
+			objects = workloadObjects
 		}
 		if opt.Controller == StatefulStateController {
 			service.ServiceType = "Headless"
@@ -1799,18 +1897,58 @@ func (k *Kubernetes) configHorizontalPodScaler(name string, service kobject.Serv
 	return nil
 }
 
-func (k *Kubernetes) PargeEnvFiletoConfigMaps(name string, service kobject.ServiceConfig, opt kobject.ConvertOptions) []runtime.Object {
-	envs := make(map[string]string)
-	for _, env := range service.Environment {
-		envs[env.Name] = env.Value
+// PargeEnvFiletoConfigMaps converts each env_file of a service into a ConfigMap.
+//
+// Each file is parsed exactly once. A ${VAR} reference inside the file resolves
+// against, in order: the service's explicit `environment`, variables defined by
+// an earlier env_file, and finally the host environment. Anything else resolves
+// to an empty string.
+func (k *Kubernetes) PargeEnvFiletoConfigMaps(name string, service kobject.ServiceConfig, opt kobject.ConvertOptions) ([]runtime.Object, error) {
+	if len(service.EnvFiles) == 0 {
+		return nil, nil
 	}
-	configMaps := make([]runtime.Object, 0)
-	for _, envFile := range service.EnvFile {
-		configMap := k.InitConfigMapForEnvWithLookup(name, opt, envFile, func(key string) (string, bool) {
-			v, ok := envs[key]
-			return v, ok
-		})
+
+	serviceEnvs := make(map[string]string, len(service.Environment))
+	for _, env := range service.Environment {
+		serviceEnvs[env.Name] = env.Value
+	}
+
+	workDir, err := transformer.GetComposeFileDir(opt.InputFiles)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to get compose file directory")
+	}
+
+	configMaps := make([]runtime.Object, 0, len(service.EnvFiles))
+	// Variables defined by earlier env_files are visible to later ones (the
+	// later file wins on duplicate keys), mirroring Compose's in-order loading.
+	accumulated := map[string]string{}
+	for _, envFile := range service.EnvFiles {
+		path := ResolveEnvFilePath(workDir, envFile.Path)
+
+		lookup := func(key string) (string, bool) {
+			if v, ok := serviceEnvs[key]; ok {
+				return v, true
+			}
+			if v, ok := accumulated[key]; ok {
+				return v, true
+			}
+			return os.LookupEnv(key)
+		}
+
+		envs := map[string]string{}
+		if err := ParseEnvFile(path, envFile.Format, envs, lookup); err != nil {
+			return nil, errors.Wrapf(err, "unable to parse env_file %q for service %q", envFile.Path, name)
+		}
+		for key, value := range envs {
+			accumulated[key] = value
+		}
+
+		configMap := initConfigMapForEnvData(name, envFile.Path, envs)
+		warnSensitiveConfigMapKeys(name, envFile.Path, envs)
+		if opt.NoInterpolate {
+			warnUnresolvedPlaceholders(name, "env_file "+envFile.Path, envs)
+		}
 		configMaps = append(configMaps, configMap)
 	}
-	return configMaps
+	return configMaps, nil
 }

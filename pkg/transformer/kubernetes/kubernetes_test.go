@@ -1282,7 +1282,7 @@ UNDEFINED_VAR=${MISSING_VAR:-default_value}
 						Value: "test-env",
 					},
 				},
-				EnvFile: []string{tempFileName},
+				EnvFiles: []kobject.EnvFile{{Path: tempFileName, Required: true}},
 			},
 			opt:  kobject.ConvertOptions{InputFiles: []string{tempFile.Name()}},
 			want: 1,
@@ -1314,7 +1314,10 @@ UNDEFINED_VAR=${MISSING_VAR:-default_value}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			k := Kubernetes{}
-			cms := k.PargeEnvFiletoConfigMaps(tc.service.Name, tc.service, tc.opt)
+			cms, err := k.PargeEnvFiletoConfigMaps(tc.service.Name, tc.service, tc.opt)
+			if err != nil {
+				t.Fatalf("PargeEnvFiletoConfigMaps returned an error: %v", err)
+			}
 			if len(cms) != tc.want {
 				t.Errorf("Expected %d ConfigMaps, got %d", tc.want, len(cms))
 			}

@@ -23,7 +23,10 @@ metadata:
   name: redis
 spec:
   containers:
-    - envFrom:
+    - env:
+        - name: ALLOW_EMPTY_PASSWORD
+          value: "no"
+      envFrom:
         - configMapRef:
             name: foo-env
         - configMapRef:

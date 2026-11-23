@@ -232,22 +232,24 @@ func Convert(opt kobject.ConvertOptions) ([]runtime.Object, error) {
 	}
 
 	// convert env_file from absolute to relative path
-	for _, service := range komposeObject.ServiceConfigs {
-		if len(service.EnvFile) <= 0 {
+	for key, service := range komposeObject.ServiceConfigs {
+		if len(service.EnvFiles) <= 0 {
 			continue
 		}
-		for i, envFile := range service.EnvFile {
-			if !filepath.IsAbs(envFile) {
+		for i, envFile := range service.EnvFiles {
+			if !filepath.IsAbs(envFile.Path) {
 				continue
 			}
 
-			relPath, err := filepath.Rel(workDir, envFile)
+			relPath, err := filepath.Rel(workDir, envFile.Path)
 			if err != nil {
 				log.Fatal(err)
 			}
 
-			service.EnvFile[i] = filepath.ToSlash(relPath)
+			service.EnvFiles[i].Path = filepath.ToSlash(relPath)
 		}
+		// ServiceConfigs is a map; the loop variable is a copy, so write it back.
+		komposeObject.ServiceConfigs[key] = service
 	}
 
 	// Get a transformer that maps komposeObject to provider's primitives

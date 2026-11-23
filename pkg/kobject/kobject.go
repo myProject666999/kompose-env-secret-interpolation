@@ -110,7 +110,7 @@ type ServiceConfig struct {
 	ContainerName                 string
 	Image                         string             `compose:"image"`
 	Environment                   []EnvVar           `compose:"environment"`
-	EnvFile                       []string           `compose:"env_file"`
+	EnvFiles                      []EnvFile          `compose:"env_file"`
 	Port                          []Ports            `compose:"ports"`
 	Command                       []string           `compose:"command"`
 	WorkingDir                    string             `compose:""`
@@ -206,6 +206,17 @@ type HealthCheck struct {
 type EnvVar struct {
 	Name  string
 	Value string
+}
+
+// EnvFile references an env_file of a service.
+//
+// Path is kept relative to the compose file directory when possible. Required
+// mirrors the compose `env_file.required` attribute (default true): a missing
+// required file is an error, a missing optional file is skipped with a warning.
+type EnvFile struct {
+	Path     string
+	Required bool
+	Format   string
 }
 
 // Ports holds the ports struct of a container

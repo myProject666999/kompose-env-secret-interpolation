@@ -19,6 +19,7 @@ package compose
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -430,48 +431,95 @@ func TestLoadEnvVar(t *testing.T) {
 }
 
 func TestParseEnvFiles(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite := func(name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("KEY=value\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	existing := mustWrite("existing.env")
+	existingAbs := mustWrite("existing-abs.env")
+	missingOptional := filepath.Join(dir, "missing-optional.env")
+	missingRequired := filepath.Join(dir, "missing-required.env")
+
 	tests := []struct {
+		name    string
 		service types.ServiceConfig
-		want    []string
+		want    []kobject.EnvFile
+		wantErr bool
 	}{
-		{service: types.ServiceConfig{
-			Name:  "baz",
-			Image: "foo/baz",
-			EnvFiles: []types.EnvFile{
-				{
-					Path:     "",
-					Required: false,
-				},
-				{
-					Path:     "foo",
-					Required: false,
-				},
-				{
-					Path:     "bar",
-					Required: true,
+		{
+			name: "relative and absolute existing files are kept",
+			service: types.ServiceConfig{
+				Name:  "baz",
+				Image: "foo/baz",
+				EnvFiles: []types.EnvFile{
+					{Path: "existing.env", Required: true},
+					{Path: existingAbs, Required: true},
 				},
 			},
-		},
-			want: []string{"", "foo", "bar"},
+			want: []kobject.EnvFile{
+				{Path: existing, Required: true},
+				{Path: existingAbs, Required: true},
+			},
 		},
 		{
+			name: "optional missing file is skipped",
+			service: types.ServiceConfig{
+				Name:  "baz",
+				Image: "foo/baz",
+				EnvFiles: []types.EnvFile{
+					{Path: "existing.env", Required: true},
+					{Path: missingOptional, Required: false},
+				},
+			},
+			want: []kobject.EnvFile{
+				{Path: existing, Required: true},
+			},
+		},
+		{
+			name: "required missing file is an error",
+			service: types.ServiceConfig{
+				Name:  "baz",
+				Image: "foo/baz",
+				EnvFiles: []types.EnvFile{
+					{Path: missingRequired, Required: true},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "no env files",
 			service: types.ServiceConfig{
 				Name:     "baz",
 				Image:    "foo/baz",
 				EnvFiles: []types.EnvFile{},
 			},
-			want: []string{},
+			want: []kobject.EnvFile{},
 		},
 	}
 
 	for _, tt := range tests {
-		sc := kobject.ServiceConfig{
-			EnvFile: []string{},
-		}
-		parseEnvFiles(&tt.service, &sc)
-		if !reflect.DeepEqual(sc.EnvFile, tt.want) {
-			t.Errorf("Expected %q, got %q", tt.want, sc.EnvFile)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			sc := kobject.ServiceConfig{
+				EnvFiles: []kobject.EnvFile{},
+			}
+			err := parseEnvFiles(&tt.service, &sc, dir)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseEnvFiles() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), missingRequired) || !strings.Contains(err.Error(), tt.service.Name) {
+					t.Fatalf("error should mention file path and service name, got: %v", err)
+				}
+				return
+			}
+			if !reflect.DeepEqual(sc.EnvFiles, tt.want) {
+				t.Errorf("Expected %#v, got %#v", tt.want, sc.EnvFiles)
+			}
+		})
 	}
 }
 

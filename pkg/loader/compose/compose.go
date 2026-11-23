@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -165,6 +166,12 @@ func (c *Compose) LoadFile(files []string, profiles []string, noInterpolate bool
 		cli.WithProfiles(profiles),
 		cli.WithEnvFiles([]string{}...),
 		cli.WithDotEnv,
+		// Environment resolution (expanding `env_file` entries into the service
+		// `environment` map, and merging host values for keys without a value) is
+		// done by kompose itself so that it can keep the boundaries between the
+		// two sources and report warnings with the owning service name. It is
+		// also the only way to honour `env_file.required` and `env_file.format`.
+		cli.WithoutEnvironmentResolution,
 	)
 	if err != nil {
 		return kobject.KomposeObject{}, errors.Wrap(err, "Unable to create compose options")
@@ -570,7 +577,9 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 		parseEnvironment(&composeServiceConfig, &serviceConfig)
 
 		// Get env_file
-		parseEnvFiles(&composeServiceConfig, &serviceConfig)
+		if err := parseEnvFiles(&composeServiceConfig, &serviceConfig, composeObject.WorkingDir); err != nil {
+			return kobject.KomposeObject{}, err
+		}
 
 		// Parse the ports
 		// v3 uses a new format called "long syntax" starting in 3.2
@@ -681,21 +690,48 @@ func parseEnvironment(composeServiceConfig *types.ServiceConfig, serviceConfig *
 			env = kobject.EnvVar{Name: name, Value: *value}
 		} else {
 			result, ok := os.LookupEnv(name)
-			if ok {
-				env = kobject.EnvVar{Name: name, Value: result}
-			} else {
+			if !ok {
+				// The compose file asks for the value to be inherited from the
+				// host environment, but the variable is not set there. Drop it
+				// rather than emitting an empty variable.
+				log.Warnf("Environment variable %q referenced by service %q is not set in the environment, ignoring it", name, composeServiceConfig.Name)
 				continue
 			}
+			env = kobject.EnvVar{Name: name, Value: result}
 		}
 		serviceConfig.Environment = append(serviceConfig.Environment, env)
 	}
 }
 
-func parseEnvFiles(composeServiceConfig *types.ServiceConfig, serviceConfig *kobject.ServiceConfig) {
+func parseEnvFiles(composeServiceConfig *types.ServiceConfig, serviceConfig *kobject.ServiceConfig, workingDir string) error {
 	for _, value := range composeServiceConfig.EnvFiles {
-		serviceConfig.EnvFile = append(serviceConfig.EnvFile, value.Path)
-		// value.Required is ignored
+		path := value.Path
+		if !filepath.IsAbs(path) && workingDir != "" {
+			path = filepath.Join(workingDir, path)
+		}
+		// `required` defaults to true: an explicitly optional env_file that does
+		// not exist is skipped with a warning, anything else is an error.
+		required := bool(value.Required)
+
+		if _, err := os.Stat(path); err != nil {
+			switch {
+			case errors.Is(err, os.ErrNotExist) && !required:
+				log.Warnf("env_file %q referenced by service %q does not exist, skipping it", path, composeServiceConfig.Name)
+				continue
+			case errors.Is(err, os.ErrNotExist):
+				return fmt.Errorf("env_file %q referenced by service %q does not exist", path, composeServiceConfig.Name)
+			default:
+				return fmt.Errorf("env_file %q referenced by service %q cannot be read: %w", path, composeServiceConfig.Name, err)
+			}
+		}
+
+		serviceConfig.EnvFiles = append(serviceConfig.EnvFiles, kobject.EnvFile{
+			Path:     path,
+			Required: required,
+			Format:   value.Format,
+		})
 	}
+	return nil
 }
 
 func handleCronJobConcurrencyPolicy(policy string) (batchv1.ConcurrencyPolicy, error) {

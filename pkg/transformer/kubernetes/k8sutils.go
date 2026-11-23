@@ -33,7 +33,6 @@ import (
 
 	"github.com/compose-spec/compose-go/v2/dotenv"
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/joho/godotenv"
 	"github.com/kubernetes/kompose/pkg/kobject"
 	"github.com/kubernetes/kompose/pkg/loader/compose"
 	"github.com/kubernetes/kompose/pkg/transformer"
@@ -975,19 +974,61 @@ func DurationStrToSecondsInt(s string) (*int64, error) {
 	return &r, nil
 }
 
-// GetEnvsFromFile get env vars from env_file
-func GetEnvsFromFile(file string) (map[string]string, error) {
-
-	envLoad, err := godotenv.Read(file)
+// ParseEnvFile parses a single env_file with the Compose specification's dotenv
+// parser. It is the one and only parsing entry point for env_file content in
+// kompose: the ConfigMap generator, the environment resolution and any future
+// consumer all go through it, so the key set seen by one consumer can never
+// diverge from another's (export prefixes, quoted multi-line values, inline
+// comments, duplicate keys, BOM headers and ${VAR} references are all handled
+// the same way everywhere).
+//
+// vars collects the parsed key/value pairs and is also consulted first when
+// expanding ${VAR} references, so a variable defined earlier in the same file
+// (or in an earlier env_file passed through the same map) wins. lookup resolves
+// references that are not present in vars; pass nil to resolve nothing.
+func ParseEnvFile(path, format string, vars map[string]string, lookup func(key string) (string, bool)) error {
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, errors.Wrap(err, "Unable to read env_file")
+		return err
 	}
+	defer file.Close()
 
-	return envLoad, nil
+	if vars == nil {
+		return errors.New("ParseEnvFile requires a non-nil destination map")
+	}
+	if err := dotenv.ParseWithFormat(file, path, vars, lookup, format); err != nil {
+		return errors.Wrapf(err, "unable to read env_file %q", path)
+	}
+	return nil
 }
 
+// ResolveEnvFilePath returns an env_file path relative to the compose file
+// directory when it is relative, and the path itself when it is absolute.
+// filepath.Join must not be used directly: it would nest an absolute path under
+// the working directory.
+func ResolveEnvFilePath(workDir, envFile string) string {
+	if filepath.IsAbs(envFile) {
+		return envFile
+	}
+	return filepath.Join(workDir, envFile)
+}
+
+// GetEnvsFromFile get env vars from env_file
+func GetEnvsFromFile(file string) (map[string]string, error) {
+	envs := map[string]string{}
+	if err := ParseEnvFile(file, "", envs, nil); err != nil {
+		return nil, err
+	}
+	return envs, nil
+}
+
+// LoadEnvFiles reads one env_file, resolving ${VAR} references through lookup.
 func LoadEnvFiles(file string, lookup func(key string) (string, bool)) (map[string]string, error) {
-	return dotenv.ReadWithLookup(lookup, file)
+	envs := map[string]string{}
+	if err := ParseEnvFile(file, "", envs, lookup); err != nil {
+		return nil, err
+	}
+	return envs, nil
 }
 
 // GetContentFromFile gets the content from the file..

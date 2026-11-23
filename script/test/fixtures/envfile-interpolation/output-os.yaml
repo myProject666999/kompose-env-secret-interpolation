@@ -30,6 +30,9 @@ spec:
         - --console-address
         - :9001
         - /data
+      env:
+        - name: DOC_ENGINE
+          value: test-env
       envFrom:
         - configMapRef:
             name: env
@@ -54,3 +57,4 @@ metadata:
   labels:
     io.kompose.service: minio-env
   name: env
+

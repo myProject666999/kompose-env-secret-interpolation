@@ -265,7 +265,6 @@ func (o *OpenShift) Transform(komposeObject kobject.KomposeObject, opt kobject.C
 		allobjects = append(allobjects, ns)
 	}
 
-	var err error
 	var composeFileDir string
 	buildRepo := opt.BuildRepo
 	buildBranch := opt.BuildBranch
@@ -340,10 +339,17 @@ func (o *OpenShift) Transform(komposeObject kobject.KomposeObject, opt kobject.C
 				objects = append(objects, pod)
 			}
 
-			envConfigMaps := o.PargeEnvFiletoConfigMaps(name, service, opt)
+			envConfigMaps, err := o.PargeEnvFiletoConfigMaps(name, service, opt)
+			if err != nil {
+				return nil, err
+			}
 			objects = append(objects, envConfigMaps...)
 		} else {
-			objects = o.CreateWorkloadAndConfigMapObjects(name, service, opt)
+			workloadObjects, err := o.CreateWorkloadAndConfigMapObjects(name, service, opt)
+			if err != nil {
+				return nil, err
+			}
+			objects = workloadObjects
 
 			if opt.CreateDeploymentConfig {
 				objects = append(objects, o.initDeploymentConfig(name, service, replica)) // OpenShift DeploymentConfigs

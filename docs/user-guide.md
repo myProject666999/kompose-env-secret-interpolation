@@ -643,3 +643,51 @@ Kompose offers you the possibility to do that. You can use `--build-command` and
 to achieve that.
 
 e.g: `kompose -f convert --build-command 'whatever command --you-use' --push-command 'whatever command --you-use'`
+
+## Environment Variables, env_file and Secrets
+
+### Interpolation
+
+Variable interpolation of `${VAR}`, `${VAR:-default}`, `${VAR-default}`, `${VAR:?message}`
+and the `$$` escape is performed by [compose-go](https://github.com/compose-spec/compose-go),
+the same library used to parse Compose files, so the behavior matches `docker compose`:
+
+| Form | Missing variable | Empty variable |
+| --- | --- | --- |
+| `${VAR}` | substituted with an empty string, with a warning | substituted with an empty string |
+| `${VAR:-default}` | uses the default | uses the default |
+| `${VAR-default}` | uses the default | keeps the empty value |
+| `${VAR:?message}` | fails with an error naming the variable | fails with an error naming the variable |
+| `$$` | a literal `$` | a literal `$` |
+
+Passing `--no-interpolate` keeps `${...}` placeholders and `$$` verbatim. Placeholders that
+survive into a generated ConfigMap or Secret are reported with a warning (only the variable
+name is shown, never the value) so that they are not silently shipped to the cluster.
+
+### Environment vs. env_file precedence
+
+When a variable is defined both in `environment` and in an `env_file`, `environment` wins,
+matching the Compose specification. Kompose realizes this by turning each `env_file` into a
+ConfigMap referenced via `envFrom`: an explicit `env` entry always overrides `envFrom` in
+Kubernetes, and the ConfigMap still keeps the value from the file. Multiple `env_file` entries
+are loaded in order, so a later file overrides an earlier one.
+
+An `env_file` entry may set `required: false` (or `required: false` in the long syntax). A
+missing file is then skipped with a warning; when `required` is omitted or `true`, a missing
+file is an error that names both the file path and the service.
+
+When `environment` is written as a bare key (`- FOO` or `FOO:` in mapping form), the value is
+taken from the host environment. If the host does not define it, the variable is dropped and a
+warning naming the service and variable is emitted. This is the behavior for both forms.
+
+### Secrets
+
+Secrets declared with `file:` are read from disk. Secrets declared with `environment:` are
+read from that environment variable and rejected when it is unset or empty. `external:
+true` secrets are ignored with a warning. For the long syntax, `mode` maps to the volume's
+`defaultMode`; `uid` and `gid` are ignored with a warning.
+
+Values of the form `/run/secrets/<name>` are rewritten to the Kubernetes Secret resource
+name only when `<name>` refers to a secret declared for that service; other strings that
+merely contain `run/secrets` are left untouched. Kompose never prints the value of an
+environment variable or secret in warnings or errors, only the key name.
